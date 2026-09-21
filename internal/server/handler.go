@@ -105,6 +105,8 @@ func (h *Handler) refreshQuota(acct *auth.Auth, tag string) (int64, bool) {
 // 再短冷却让下次挑号避开它。返回传入的 cause 供调用方记 lastErr。
 // 注意：这里只用 SetCredits 更新数值，不用 ReenableIfCredits —— 空响应的账号不该被解冻。
 func (h *Handler) penalizeEmpty(acct *auth.Auth, cause error, where string) error {
+	// 先归零：查询失败也不会带着陈旧高分复活（与 402 路径一致）
+	h.cfg.Pool.SetCredits(acct.UID, 0)
 	h.refreshQuota(acct, "empty/"+where)
 	log.Printf("empty-response uid=%s cause=%v (cooldown %v)", acct.UID, cause, h.cfg.EmptyCooldown)
 	h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.EmptyCooldown, "empty response")
@@ -253,12 +255,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(h.cfg.Upstream.LastBody))
 			switch kind {
 			case upstream.ErrHardCredit:
-				// 余额不足：先查一次真实积分写回（避免陈旧快照），再长冷却
-				if remain, ok := h.refreshQuota(acct, "hard-credit"); ok && remain > 0 {
-					log.Printf("quota[hard-credit] uid=%s: classified as no-credit but %d remain — 可能是关键词误判", acct.UID, remain)
+				// refreshQuota 会覆盖共享的 LastBody，先留存本次响应体
+				rawBody := string(h.cfg.Upstream.LastBody)
+				// 先强制归零：即使后面查询失败，也不会带着陈旧高分占住队首
+				h.cfg.Pool.SetCredits(acct.UID, 0)
+				// 再用真实积分覆盖，防止关键词误判把有余额的号冻死
+				remain, ok := h.refreshQuota(acct, "hard-credit")
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: rawBody}
+				if ok && remain > 0 {
+					// 确实还有余额 → 判定存疑，改用短冷却，避免误伤 12h
+					log.Printf("quota[hard-credit] uid=%s: %d remain — 疑似关键词误判，改用短冷却 %v",
+						acct.UID, remain, h.cfg.SoftCooldown)
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "疑似余额误判")
+					continue
 				}
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
 			case upstream.ErrSoftRate:
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
