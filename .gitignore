@@ -24,3 +24,6 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# WorkBuddy 本地会话数据（不入库）
+.workbuddy/
