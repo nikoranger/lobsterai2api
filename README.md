@@ -81,6 +81,7 @@ See `config.example.json`. Environment variable prefix `LB2A_*`:
 | `LB2A_AUTH_DIR` | Auth file directory |
 | `LB2A_STATE_FILE` | Pool state file |
 | `LB2A_HARD_CREDIT` / `LB2A_SOFT_RATE` | Cooldown durations |
+| `LB2A_EMPTY_COOLDOWN` | Cooldown after an empty upstream response (default `60s`) |
 | `LB2A_ERR_THRESHOLD` / `LB2A_ERR_COOLDOWN` | Error threshold and cooldown |
 | `LB2A_TIMEOUT_SECONDS` | Upstream timeout |
 | `LB2A_UPSTREAM_BASE` | Upstream API base URL (required) |

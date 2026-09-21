@@ -5,26 +5,29 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"lobsterai2api/internal/auth"
 	"lobsterai2api/internal/pool"
 	"lobsterai2api/internal/upstream"
 )
 
 // Config handler 依赖。
 type Config struct {
-	Pool         *pool.Pool
-	Upstream     *upstream.Client
-	APIKey       string        // 空 = 不鉴权
-	MaxRotate    int           // 单请求最多换号次数，默认 3
-	HardCooldown time.Duration // 余额不足冷却，默认 12h
-	SoftCooldown time.Duration // 429 冷却，默认 60s
-	ErrThreshold int           // 连续其他错误冷却阈值，默认 3
-	ErrCooldown  time.Duration // 错误冷却时长，默认 10m
-	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	Pool          *pool.Pool
+	Upstream      *upstream.Client
+	APIKey        string        // 空 = 不鉴权
+	MaxRotate     int           // 单请求最多换号次数，默认 3
+	HardCooldown  time.Duration // 余额不足冷却，默认 12h
+	SoftCooldown  time.Duration // 429 冷却，默认 60s
+	EmptyCooldown time.Duration // 空响应冷却，默认 60s；0 = 只换号不冷却
+	ErrThreshold  int           // 连续其他错误冷却阈值，默认 3
+	ErrCooldown   time.Duration // 错误冷却时长，默认 10m
+	RefreshSkew   time.Duration // token 提前刷新窗口，默认 10m
 }
 
 // Handler 主路由。
@@ -44,6 +47,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 60 * time.Second
 	}
+	// EmptyCooldown 为 0 时只换号不冷却（由 config 层给默认 60s）
 	if cfg.ErrThreshold <= 0 {
 		cfg.ErrThreshold = 3
 	}
@@ -76,6 +80,35 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// refreshQuota 查一次真实积分并写回池子（只更新数值，不做解冻）。
+// tag 用于日志区分触发来源；查询失败返回 false（调用方应继续原有处置）。
+func (h *Handler) refreshQuota(acct *auth.Auth, tag string) (int64, bool) {
+	start := time.Now()
+	remain, _, qerr := h.cfg.Upstream.QuotaUsage(acct)
+	cost := time.Since(start).Round(time.Millisecond)
+	name := acct.Nickname
+	if name == "" {
+		name = acct.UID
+	}
+	if qerr != nil {
+		log.Printf("quota[%s] uid=%s nick=%s query failed cost=%v err=%v", tag, acct.UID, name, cost, qerr)
+		return 0, false
+	}
+	h.cfg.Pool.SetCredits(acct.UID, remain)
+	log.Printf("quota[%s] uid=%s nick=%s remain=%d cost=%v", tag, acct.UID, name, remain, cost)
+	return remain, true
+}
+
+// penalizeEmpty 空响应处置：查一次真实积分（很可能是余额耗尽导致空回复），
+// 再短冷却让下次挑号避开它。返回传入的 cause 供调用方记 lastErr。
+// 注意：这里只用 SetCredits 更新数值，不用 ReenableIfCredits —— 空响应的账号不该被解冻。
+func (h *Handler) penalizeEmpty(acct *auth.Auth, cause error, where string) error {
+	h.refreshQuota(acct, "empty/"+where)
+	log.Printf("empty-response uid=%s cause=%v (cooldown %v)", acct.UID, cause, h.cfg.EmptyCooldown)
+	h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.EmptyCooldown, "empty response")
+	return cause
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +214,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
@@ -219,6 +253,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(h.cfg.Upstream.LastBody))
 			switch kind {
 			case upstream.ErrHardCredit:
+				// 余额不足：先查一次真实积分写回（避免陈旧快照），再长冷却
+				if remain, ok := h.refreshQuota(acct, "hard-credit"); ok && remain > 0 {
+					log.Printf("quota[hard-credit] uid=%s: classified as no-credit but %d remain — 可能是关键词误判", acct.UID, remain)
+				}
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
@@ -242,17 +280,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		defer rc.Close()
-		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 流式：预读未拿到任何实质内容时，还没写过字节 → 换号重试
 		if peek.Stream {
-			_ = upstream.Stream(w, rc)
+			sawContent, serr := upstream.Stream(w, rc)
+			rc.Close()
+			if serr != nil {
+				log.Printf("chat_stream uid=%s: %v", acct.UID, serr)
+				if sawContent {
+					return // 已向客户端输出，无法再换号
+				}
+				lastErr = serr
+				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				continue
+			}
+			if !sawContent {
+				lastErr = h.penalizeEmpty(acct, errors.New("empty upstream stream"), "stream")
+				continue
+			}
+			h.cfg.Pool.NoteSuccess(acct.UID)
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		// 非流式：空响应/业务错误 → 刷新积分 + 冷却 + 换号重试
+		resp, err := upstream.Aggregate(rc, peek.Model)
+		rc.Close()
 		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-			return
+			lastErr = h.penalizeEmpty(acct, err, "aggregate")
+			continue
 		}
+		h.cfg.Pool.NoteSuccess(acct.UID)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
